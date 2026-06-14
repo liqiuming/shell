@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import ssl
@@ -19,6 +20,19 @@ DEFAULT_BASE_URL = "https://maas.mlsvcloud.com:8559/maas/ai/aiFactoryServer/v1/a
 DEFAULT_MODEL = "Kimi-K2.6-mls"
 DEFAULT_SYSTEM_PROMPT = "你是一个服务预热助手。请稳定、简短地回答。"
 DEFAULT_TIMEOUT = 600
+
+
+@dataclasses.dataclass
+class RequestResult:
+    round_index: int
+    label: str
+    elapsed: float
+    ttft: float | None
+    output_chars: int
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+    summary: str
 
 
 def parse_args() -> argparse.Namespace:
@@ -160,10 +174,16 @@ def make_request(
     return urllib.request.Request(url=url, data=payload, headers=headers, method="POST")
 
 
-def read_streaming_response(response: Iterable[bytes], started_at: float) -> Tuple[float | None, int, str]:
+def read_streaming_response(
+    response: Iterable[bytes], started_at: float
+) -> Tuple[float | None, int, str, str, int | None, int | None, int | None]:
     ttft = None
     chunk_count = 0
     preview = ""
+    output_parts: List[str] = []
+    prompt_tokens = None
+    completion_tokens = None
+    total_tokens = None
 
     for raw_line in response:
         line = raw_line.decode("utf-8", errors="ignore").strip()
@@ -189,21 +209,45 @@ def read_streaming_response(response: Iterable[bytes], started_at: float) -> Tup
         if choices:
             delta = choices[0].get("delta") or {}
             content = delta.get("content") or ""
-            if content and not preview:
-                preview = content[:120]
+            if isinstance(content, list):
+                text_parts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                content = "".join(text_parts)
+            if content:
+                output_parts.append(str(content))
+                if not preview:
+                    preview = str(content)[:120]
 
-    return ttft, chunk_count, preview
+        usage = event.get("usage") or {}
+        if usage:
+            prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+            completion_tokens = usage.get("completion_tokens", completion_tokens)
+            total_tokens = usage.get("total_tokens", total_tokens)
+
+    output_text = "".join(output_parts)
+    return (
+        ttft,
+        chunk_count,
+        preview,
+        output_text,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+    )
 
 
-def read_normal_response(body: bytes) -> str:
+def read_normal_response(body: bytes) -> Tuple[str, int | None, int | None, int | None]:
     try:
         data = json.loads(body.decode("utf-8"))
     except json.JSONDecodeError:
-        return body.decode("utf-8", errors="ignore")[:200]
+        text = body.decode("utf-8", errors="ignore")
+        return text[:200], None, None, None
 
     choices = data.get("choices") or []
     if not choices:
-        return json.dumps(data, ensure_ascii=False)[:200]
+        return json.dumps(data, ensure_ascii=False)[:200], None, None, None
 
     message = choices[0].get("message") or {}
     content = message.get("content") or ""
@@ -213,7 +257,13 @@ def read_normal_response(body: bytes) -> str:
             if isinstance(item, dict) and item.get("type") == "text":
                 parts.append(item.get("text", ""))
         content = "".join(parts)
-    return str(content)[:200]
+    usage = data.get("usage") or {}
+    return (
+        str(content)[:200],
+        usage.get("prompt_tokens"),
+        usage.get("completion_tokens"),
+        usage.get("total_tokens"),
+    )
 
 
 def perform_request(
@@ -226,23 +276,85 @@ def perform_request(
     temperature: float,
     timeout: int,
     ssl_context: ssl.SSLContext,
-) -> Tuple[float, float | None, str]:
+) -> Tuple[float, float | None, int, int | None, int | None, int | None, str]:
     payload = build_payload(model, prompt, stream, max_tokens, temperature)
     request = make_request(url, api_key, payload)
     started_at = time.perf_counter()
 
     with urllib.request.urlopen(request, timeout=timeout, context=ssl_context) as response:
         if stream:
-            ttft, chunk_count, preview = read_streaming_response(response, started_at)
+            (
+                ttft,
+                chunk_count,
+                preview,
+                output_text,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+            ) = read_streaming_response(response, started_at)
             summary = f"stream chunks={chunk_count}, preview={preview or '<empty>'}"
+            output_chars = len(output_text)
         else:
             body = response.read()
             ttft = None
-            preview = read_normal_response(body)
+            preview, prompt_tokens, completion_tokens, total_tokens = read_normal_response(body)
             summary = f"preview={preview or '<empty>'}"
+            output_chars = len(preview or "")
 
     elapsed = time.perf_counter() - started_at
-    return elapsed, ttft, summary
+    return (
+        elapsed,
+        ttft,
+        output_chars,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        summary,
+    )
+
+
+def format_token_text(
+    prompt_tokens: int | None, completion_tokens: int | None, total_tokens: int | None
+) -> str:
+    if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+        return "tokens=n/a"
+    return (
+        "tokens="
+        f"prompt:{prompt_tokens if prompt_tokens is not None else 'n/a'}"
+        f"/completion:{completion_tokens if completion_tokens is not None else 'n/a'}"
+        f"/total:{total_tokens if total_tokens is not None else 'n/a'}"
+    )
+
+
+def summarize_round_change(results: List[RequestResult], rounds: int) -> None:
+    if rounds < 2:
+        return
+
+    print("-" * 72)
+    print("首轮与末轮对比:")
+    labels = sorted({result.label for result in results})
+    for label in labels:
+        first = next((item for item in results if item.label == label and item.round_index == 1), None)
+        last = next((item for item in results if item.label == label and item.round_index == rounds), None)
+        if not first or not last:
+            continue
+
+        elapsed_delta = last.elapsed - first.elapsed
+        ttft_delta = None
+        if first.ttft is not None and last.ttft is not None:
+            ttft_delta = last.ttft - first.ttft
+
+        trend = "更快" if elapsed_delta < 0 else "更慢" if elapsed_delta > 0 else "持平"
+        compare_text = (
+            f"[COMPARE] prompt={label:<6} total: {first.elapsed:.3f}s -> {last.elapsed:.3f}s "
+            f"({elapsed_delta:+.3f}s, {trend})"
+        )
+        if ttft_delta is not None:
+            compare_text += (
+                f", ttft: {first.ttft:.3f}s -> {last.ttft:.3f}s ({ttft_delta:+.3f}s)"
+            )
+        compare_text += f", chars: {first.output_chars} -> {last.output_chars}"
+        print(compare_text)
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -277,12 +389,21 @@ def main() -> int:
     total_requests = 0
     success_requests = 0
     total_elapsed = 0.0
+    results: List[RequestResult] = []
 
     for round_index in range(1, args.rounds + 1):
         for label, prompt in prompts:
             total_requests += 1
             try:
-                elapsed, ttft, summary = perform_request(
+                (
+                    elapsed,
+                    ttft,
+                    output_chars,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                    summary,
+                ) = perform_request(
                     url=url,
                     api_key=args.api_key,
                     model=args.model,
@@ -295,10 +416,29 @@ def main() -> int:
                 )
                 success_requests += 1
                 total_elapsed += elapsed
+                results.append(
+                    RequestResult(
+                        round_index=round_index,
+                        label=label,
+                        elapsed=elapsed,
+                        ttft=ttft,
+                        output_chars=output_chars,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=total_tokens,
+                        summary=summary,
+                    )
+                )
                 ttft_text = f"{ttft:.3f}s" if ttft is not None else "n/a"
+                token_text = format_token_text(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                )
                 print(
                     f"[OK] round={round_index} prompt={label:<6} "
-                    f"elapsed={elapsed:.3f}s ttft={ttft_text} {summary}"
+                    f"elapsed={elapsed:.3f}s ttft={ttft_text} chars={output_chars} "
+                    f"{token_text} {summary}"
                 )
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="ignore")[:300]
@@ -323,6 +463,7 @@ def main() -> int:
         f"完成: success={success_requests}/{total_requests}, "
         f"avg_elapsed={avg_elapsed:.3f}s"
     )
+    summarize_round_change(results, args.rounds)
     return 0 if success_requests == total_requests else 1
 
 
